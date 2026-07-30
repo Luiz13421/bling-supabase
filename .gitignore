@@ -1,1 +1,16 @@
+# Arquivos de variáveis de ambiente (SENHAS E CHAVES SECRETAS)
 .env
+.env.local
+*.env
+
+# Dependências do Node (pasta pesada que não deve ir pro Git)
+node_modules/
+
+# Logs de execução e erros
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Arquivos do sistema operacional
+.DS_Store
+Thumbs.db
