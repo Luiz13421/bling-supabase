@@ -63,14 +63,35 @@ async function getAccessToken() {
 }
 
 /**
- * 2. Função genérica de paginação para qualquer endpoint do Bling
+ * 2. Consulta a última data de atualização no Supabase para sincronização incremental
  */
-async function fetchPaginatedData(accessToken, endpoint, nomeRecurso) {
+async function getUltimaAtualizacao(tabela) {
+  try {
+    const { data, error } = await supabase
+      .from(tabela)
+      .select('updated_at')
+      .order('updated_at', { ascending: false })
+      .limit(1);
+
+    if (error || !data || data.length === 0) return null;
+
+    // Retorna a data no formato YYYY-MM-DD para o Bling
+    return data[0].updated_at.split('T')[0];
+  } catch (error) {
+    console.error(`⚠️ Erro ao buscar última atualização da tabela ${tabela}:`, error.message);
+    return null;
+  }
+}
+
+/**
+ * 3. Função genérica de paginação para qualquer endpoint do Bling (agora aceita filtros)
+ */
+async function fetchPaginatedData(accessToken, endpoint, nomeRecurso, filtrosExtras = {}) {
   let pagina = 1;
   let todosItens = [];
   let temMaisPaginas = true;
 
-  console.log(`📦 Buscando ${nomeRecurso} do Bling...`);
+  console.log(`📦 Buscando ${nomeRecurso} do Bling... ${filtrosExtras.dataAlteracaoInicial ? `(A partir de: ${filtrosExtras.dataAlteracaoInicial})` : '(Tudo)'}`);
 
   while (temMaisPaginas) {
     try {
@@ -81,6 +102,7 @@ async function fetchPaginatedData(accessToken, endpoint, nomeRecurso) {
         params: {
           limite: 100,
           pagina: pagina,
+          ...filtrosExtras, // Adiciona filtros como dataAlteracaoInicial aqui
         },
       });
 
@@ -92,8 +114,12 @@ async function fetchPaginatedData(accessToken, endpoint, nomeRecurso) {
       } else {
         temMaisPaginas = false;
       }
+
+      // ⏱️ Pausa de 350ms para respeitar o limite de 3 req/seg da API do Bling
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
     } catch (error) {
-      console.error(`❌ Erro ao buscar ${nomeRecurso} (página ${pagina}):`, error.response?.data || error.message);
+      console.error(`❌ Erro ao buscar ${nomeRecurso} (página ${pagina}):`, JSON.stringify(error.response?.data, null, 2) || error.message);
       temMaisPaginas = false;
     }
   }
@@ -102,11 +128,165 @@ async function fetchPaginatedData(accessToken, endpoint, nomeRecurso) {
   return todosItens;
 }
 
-/**
- * Sincronização de Produtos
- */
+/* ==========================================================
+ * SINCRONIZAÇÕES (CADASTROS BASE - SEM FILTRO DE DATA)
+ * ========================================================== */
+
+async function sincronizarSituacoes(token) {
+  try {
+    console.log('📦 Buscando Módulos de Situações...');
+    
+    // 1. Busca todos os módulos que possuem situações na sua conta
+    const modulosResponse = await axios.get('https://www.bling.com.br/Api/v3/situacoes/modulos', {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+
+    const modulos = modulosResponse.data.data || [];
+    if (!modulos.length) {
+      console.log('🎯 Situações: Nenhum módulo encontrado na conta.');
+      return;
+    }
+
+    let todasSituacoes = [];
+    console.log(`🔎 Encontrados ${modulos.length} módulos. Baixando situações de cada um...`);
+
+    // 2. Loop passando por cada módulo (Vendas, NFe, OS, etc.) para pegar suas situações
+    for (const modulo of modulos) {
+      try {
+        const response = await axios.get(`https://www.bling.com.br/Api/v3/situacoes/modulos/${modulo.id}`, {
+          headers: { Authorization: `Bearer ${token}` }
+        });
+
+        const situacoes = response.data.data || [];
+        
+        const formatados = situacoes.map((item) => ({
+          id: item.id,
+          nome: item.nome,
+          id_herdado: item.idHerdado || 0,
+          cor: item.cor || null,
+          raw_data: { ...item, nome_modulo: modulo.descricao }, // Guarda o nome do módulo no raw_data para referência
+          updated_at: new Date().toISOString(),
+        }));
+
+        todasSituacoes = todasSituacoes.concat(formatados);
+
+        // ⏱️ Respeitar o limite de 3 requisições por segundo
+        await new Promise((resolve) => setTimeout(resolve, 350));
+      } catch (err) {
+        // Se der erro em um módulo específico, avisa e continua os outros
+        console.error(`⚠️ Erro ao buscar situações do módulo ${modulo.descricao || modulo.id}:`, err.response?.data?.error?.message || err.message);
+      }
+    }
+
+    // 3. Salva tudo no banco de dados de uma vez
+    if (todasSituacoes.length > 0) {
+      const { error } = await supabase.from('bling_situacoes').upsert(todasSituacoes, { onConflict: 'id' });
+      if (error) {
+        console.error('❌ Erro ao salvar situações:', error);
+      } else {
+        console.log(`🚀 ${todasSituacoes.length} Situações (de ${modulos.length} módulos) sincronizadas com sucesso!`);
+      }
+    } else {
+      console.log('🎯 Situações: Nenhuma situação individual encontrada dentro dos módulos.');
+    }
+
+  } catch (error) {
+    console.error(
+      '❌ Erro ao buscar a lista de Módulos de Situações:', 
+      JSON.stringify(error.response?.data, null, 2) || error.message
+    );
+  }
+}
+
+async function sincronizarCategorias(token) {
+  const dados = await fetchPaginatedData(token, 'categorias/receitas-despesas', 'Categorias');
+  if (!dados.length) return;
+
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    descricao: item.descricao,
+    id_categoria_pai: item.idCategoriaPai || 0,
+    tipo: item.tipo,
+    situacao: item.situacao,
+    raw_data: item,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('bling_categorias').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar categorias:', error);
+  else console.log(`🚀 Categorias sincronizadas com sucesso!`);
+}
+
+async function sincronizarVendedores(token) {
+  const dados = await fetchPaginatedData(token, 'vendedores', 'Vendedores');
+  if (!dados.length) return;
+
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    contato_id: item.contato?.id || null,
+    nome: item.contato?.nome || null,
+    situacao: item.contato?.situacao || null,
+    loja_id: item.loja?.id || null,
+    desconto_limite: item.descontoLimite || 0,
+    raw_data: item,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('bling_vendedores').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar vendedores:', error);
+  else console.log(`🚀 Vendedores sincronizados com sucesso!`);
+}
+
+async function sincronizarCaixasBancos(token) {
+  const dados = await fetchPaginatedData(token, 'contas-contabeis', 'Caixas e Bancos');
+  if (!dados.length) return;
+
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    descricao: item.descricao,
+    tipo: item.tipo,
+    situacao: item.situacao,
+    raw_data: item,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('bling_caixas_bancos').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar caixas e bancos:', error);
+  else console.log(`🚀 Caixas e Bancos sincronizados com sucesso!`);
+}
+
+/* ==========================================================
+ * SINCRONIZAÇÕES PESADAS (COM INTELIGÊNCIA DE DATA)
+ * ========================================================== */
+
+async function sincronizarContatos(token) {
+  const dataUltima = await getUltimaAtualizacao('contatos');
+  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+
+  const dados = await fetchPaginatedData(token, 'contatos', 'Contatos', filtros);
+  if (!dados.length) return;
+
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    nome: item.nome,
+    codigo: item.codigo || null,
+    situacao: item.situacao || null,
+    numero_documento: item.numeroDocumento || null,
+    telefone: item.telefone || null,
+    celular: item.celular || null,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('contatos').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar contatos:', error);
+  else console.log(`🚀 Contatos sincronizados com sucesso!`);
+}
+
 async function sincronizarProdutos(token) {
-  const dados = await fetchPaginatedData(token, 'produtos', 'Produtos');
+  const dataUltima = await getUltimaAtualizacao('produtos');
+  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+
+  const dados = await fetchPaginatedData(token, 'produtos', 'Produtos', filtros);
   if (!dados.length) return;
 
   const formatados = dados.map((item) => ({
@@ -123,31 +303,72 @@ async function sincronizarProdutos(token) {
   else console.log(`🚀 Produtos sincronizados com sucesso!`);
 }
 
-/**
- * Sincronização de Estoques
- */
-async function sincronizarEstoques(token) {
-  const dados = await fetchPaginatedData(token, 'estoques/saldos', 'Estoques');
+async function sincronizarContasPagar(token) {
+  const dataUltima = await getUltimaAtualizacao('bling_contas_pagar');
+  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+
+  const dados = await fetchPaginatedData(token, 'contas/pagar', 'Contas a Pagar', filtros);
   if (!dados.length) return;
 
-  const formatados = dados.map((item, index) => ({
-    id: item.produto?.id || index,
-    produto_id: item.produto?.id,
-    saldo_fisico: item.saldoFisico,
-    saldo_virtual: item.saldoVirtual,
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    situacao_id: item.situacao,
+    vencimento: item.vencimento,
+    vencimento_original: item.vencimentoOriginal,
+    data_emissao: item.dataEmissao,
+    valor: item.valor,
+    saldo: item.saldo,
+    contato_id: item.contato?.id || null,
+    forma_pagamento_id: item.formaPagamento?.id || null,
+    portador_id: item.portador?.id || null,
+    competencia: item.competencia || null,
+    numero_documento: item.numeroDocumento || null,
+    historico: item.historico || null,
+    raw_data: item,
     updated_at: new Date().toISOString(),
   }));
 
-  const { error } = await supabase.from('estoques').upsert(formatados, { onConflict: 'id' });
-  if (error) console.error('❌ Erro ao salvar estoques:', error);
-  else console.log(`🚀 Estoques sincronizados com sucesso!`);
+  const { error } = await supabase.from('bling_contas_pagar').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar contas a pagar:', error);
+  else console.log(`🚀 Contas a Pagar sincronizadas com sucesso!`);
 }
 
-/**
- * Sincronização de Vendas (Pedidos de Venda detalhados)
- */
+async function sincronizarContasReceber(token) {
+  const dataUltima = await getUltimaAtualizacao('bling_contas_receber');
+  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+
+  const dados = await fetchPaginatedData(token, 'contas/receber', 'Contas a Receber', filtros);
+  if (!dados.length) return;
+
+  const formatados = dados.map((item) => ({
+    id: item.id,
+    situacao_id: item.situacao,
+    vencimento: item.vencimento,
+    vencimento_original: item.vencimentoOriginal,
+    data_emissao: item.dataEmissao,
+    valor: item.valor,
+    saldo: item.saldo,
+    contato_id: item.contato?.id || null,
+    contato_nome: item.contato?.nome || null,
+    forma_pagamento_id: item.formaPagamento?.id || null,
+    categoria_id: item.categoria?.id || null,
+    vendedor_id: item.vendedor?.id || null,
+    origem_id: item.origem?.id || null,
+    origem_tipo: item.origem?.tipoOrigem || null,
+    raw_data: item,
+    updated_at: new Date().toISOString(),
+  }));
+
+  const { error } = await supabase.from('bling_contas_receber').upsert(formatados, { onConflict: 'id' });
+  if (error) console.error('❌ Erro ao salvar contas a receber:', error);
+  else console.log(`🚀 Contas a Receber sincronizadas com sucesso!`);
+}
+
 async function sincronizarVendas(token) {
-  const resumoVendas = await fetchPaginatedData(token, 'pedidos/vendas', 'Vendas');
+  const dataUltima = await getUltimaAtualizacao('vendas');
+  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+
+  const resumoVendas = await fetchPaginatedData(token, 'pedidos/vendas', 'Vendas', filtros);
   if (!resumoVendas.length) return;
 
   console.log(`🔎 Buscando detalhes individuais de ${resumoVendas.length} vendas...`);
@@ -156,7 +377,6 @@ async function sincronizarVendas(token) {
 
   for (const itemResumo of resumoVendas) {
     try {
-      // Busca os detalhes completos de cada pedido
       const responseDetalhe = await axios.get(
         `https://www.bling.com.br/Api/v3/pedidos/vendas/${itemResumo.id}`,
         {
@@ -179,13 +399,13 @@ async function sincronizarVendas(token) {
         updated_at: new Date().toISOString(),
       });
 
-      // Pequena pausa (100ms) para não estourar o limite de requisições por segundo do Bling
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      // Aumentado para 350ms para respeitar a trava do Bling (máx. 3 req/s)
+      await new Promise((resolve) => setTimeout(resolve, 350));
 
     } catch (error) {
       console.error(
         `⚠️ Erro ao buscar detalhe da venda ${itemResumo.id}:`,
-        error.response?.data || error.message
+        JSON.stringify(error.response?.data, null, 2) || error.message
       );
     }
   }
@@ -205,10 +425,18 @@ async function main() {
     console.log('🔄 Iniciando pipeline completo Bling -> Supabase...');
     const token = await getAccessToken();
 
+    // 1. Tabelas auxiliares / cadastros base (Sempre puxa tudo, costuma ser leve)
+    await sincronizarSituacoes(token);
+    await sincronizarCategorias(token);
+    await sincronizarVendedores(token);
+    await sincronizarCaixasBancos(token);
+    
+    // 2. Tabelas pesadas (Com filtro inteligente de data)
+    await sincronizarContatos(token);
     await sincronizarProdutos(token);
-    await sincronizarEstoques(token);
+    await sincronizarContasPagar(token);
+    await sincronizarContasReceber(token);
     await sincronizarVendas(token);
-    await sincronizarPropostas(token);
 
     console.log('✨ Pipeline executado de ponta a ponta com sucesso!');
   } catch (error) {

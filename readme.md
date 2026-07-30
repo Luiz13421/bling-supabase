@@ -4,6 +4,26 @@ Este projeto consiste em uma integração automatizada entre o **Bling ERP (API 
 
 ---
 
+*Resumo do Algoritmo Completo*
+Se fosse explicar o fluxo completo passo a passo, a lógica seria:
+
+- Inicialização: Importa bibliotecas e conecta ao Supabase.
+
+- Autenticação e Rotação:
+   - Envia o refresh_token atual para o Bling.
+   - Recebe o novo access_token e um novo refresh_token. 
+   - Atualiza o .env no disco com o novo refresh_token.
+
+- Definição de Helpers:
+   - Cria a função genérica fetchPaginatedData que lida com paginação em loop (while) e controle de limite.
+
+- Funções de Mapeamento e Upsert:
+   - Para cada endpoint, busca os dados, extrai os campos e executa o .upsert() no Supabase.
+   - Trata requisições detalhadas item a item (com intervalo de segurança/delay).
+   
+Orquestração (Função main):
+   - Executa a sincronização na ordem correta de dependências (Cadastros Base $\rightarrow$ Movimentações Financeiras/Vendas).
+
 ## 🛠️ Tecnologias Utilizadas
 
 - **[Node.js](https://nodejs.org/):** Ambiente de execução JavaScript no servidor.
