@@ -368,38 +368,56 @@ async function sincronizarVendas(token) {
   const dataUltima = await getUltimaAtualizacao('vendas');
   const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
 
+  // 1. Busca a lista de vendas (resumo) para pegar os IDs
   const resumoVendas = await fetchPaginatedData(token, 'pedidos/vendas', 'Vendas', filtros);
   if (!resumoVendas.length) return;
 
-  console.log(`🔎 Buscando detalhes individuais de ${resumoVendas.length} vendas...`);
+  console.log(`🔎 Buscando detalhes e PRODUTOS de ${resumoVendas.length} vendas...`);
   
-  const formatados = [];
+  const vendasFormatadas = [];
+  const itensFormatados = []; // Array para guardar os produtos vendidos
 
   for (const itemResumo of resumoVendas) {
     try {
+      // 2. Chama o endpoint da sua imagem para pegar os detalhes completos
       const responseDetalhe = await axios.get(
         `https://www.bling.com.br/Api/v3/pedidos/vendas/${itemResumo.id}`,
-        {
-          headers: { Authorization: `Bearer ${token}` },
-        }
+        { headers: { Authorization: `Bearer ${token}` } }
       );
 
-      const item = responseDetalhe.data.data;
+      const venda = responseDetalhe.data.data;
 
-      formatados.push({
-        id: item.id,
-        numero: String(item.numero),
-        data: item.data,
-        valor: item.total || item.valor,
-        situacao: item.situacao?.id || item.situacao,
-        id_contato: item.contato?.id || null,
-        id_loja: item.loja?.id || null,
-        id_vendedor: item.vendedor?.id || null,
-        id_unidade_negocio: item.unidadeNegocio?.id || null,
+      // 3. Formata os dados principais da Venda
+      vendasFormatadas.push({
+        id: venda.id,
+        numero: String(venda.numero),
+        data: venda.data,
+        valor: venda.total || venda.valor,
+        situacao: venda.situacao?.id || venda.situacao,
+        id_contato: venda.contato?.id || null,
+        id_loja: venda.loja?.id || null,
+        id_vendedor: venda.vendedor?.id || null,
+        id_unidade_negocio: venda.unidadeNegocio?.id || null,
         updated_at: new Date().toISOString(),
       });
 
-      // Aumentado para 350ms para respeitar a trava do Bling (máx. 3 req/s)
+      // 4. Extrai a lista de produtos (itens) de dentro do pedido
+      if (venda.itens && venda.itens.length > 0) {
+        for (const item of venda.itens) {
+          itensFormatados.push({
+            id: item.id, // ID exclusivo da linha do item no Bling
+            id_venda: venda.id, // Relacionamento com a venda pai
+            id_produto: item.produto?.id || null, // Relacionamento com o cadastro de produtos
+            codigo: item.codigo,
+            descricao: item.descricao,
+            quantidade: item.quantidade,
+            valor_unitario: item.valor,
+            updated_at: new Date().toISOString(),
+          });
+        }
+      }
+
+      // Respeitar o limite de requisições do Bling
       await new Promise((resolve) => setTimeout(resolve, 350));
 
     } catch (error) {
@@ -410,10 +428,18 @@ async function sincronizarVendas(token) {
     }
   }
 
-  if (formatados.length > 0) {
-    const { error } = await supabase.from('vendas').upsert(formatados, { onConflict: 'id' });
-    if (error) console.error('❌ Erro ao salvar vendas:', error);
-    else console.log(`🚀 ${formatados.length} vendas (com detalhes) sincronizadas com sucesso!`);
+  // 5. Salva as Vendas no Supabase
+  if (vendasFormatadas.length > 0) {
+    const { error: errVendas } = await supabase.from('vendas').upsert(vendasFormatadas, { onConflict: 'id' });
+    if (errVendas) console.error('❌ Erro ao salvar vendas:', errVendas);
+    else console.log(`🚀 ${vendasFormatadas.length} vendas sincronizadas com sucesso!`);
+  }
+
+  // 6. Salva os Itens das Vendas no Supabase
+  if (itensFormatados.length > 0) {
+    const { error: errItens } = await supabase.from('itens_venda').upsert(itensFormatados, { onConflict: 'id' });
+    if (errItens) console.error('❌ Erro ao salvar itens das vendas:', errItens);
+    else console.log(`🚀 ${itensFormatados.length} produtos vendidos sincronizados com sucesso!`);
   }
 }
 
