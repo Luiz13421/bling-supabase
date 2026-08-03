@@ -73,10 +73,18 @@ async function getUltimaAtualizacao(tabela) {
       .order('updated_at', { ascending: false })
       .limit(1);
 
-    if (error || !data || data.length === 0) return null;
+    // 1. Mostra o valor exato que está dentro do array
+    console.log(`🔎 Dados brutos da tabela ${tabela}:`, data[0]);
 
-    // Retorna a data no formato YYYY-MM-DD para o Bling
-    return data[0].updated_at.split('T')[0];
+    // 2. Trava de segurança caso a tabela esteja vazia ou a data seja nula
+    if (error || !data || data.length === 0 || !data[0].updated_at) {
+      return null;
+    }
+
+    // 3. Pega a data no formato YYYY-MM-DD
+    const dataFormatada = data[0].updated_at.split('T')[0];
+    return dataFormatada;
+
   } catch (error) {
     console.error(`⚠️ Erro ao buscar última atualização da tabela ${tabela}:`, error.message);
     return null;
@@ -261,7 +269,11 @@ async function sincronizarCaixasBancos(token) {
 
 async function sincronizarContatos(token) {
   const dataUltima = await getUltimaAtualizacao('contatos');
-  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+  const hoje = new Date().toISOString().split('T')[0];
+  const filtros = dataUltima ? { 
+  dataAlteracaoInicial: dataUltima, 
+  dataAlteracaoFinal: hoje 
+} : {};
 
   const dados = await fetchPaginatedData(token, 'contatos', 'Contatos', filtros);
   if (!dados.length) return;
@@ -284,7 +296,11 @@ async function sincronizarContatos(token) {
 
 async function sincronizarProdutos(token) {
   const dataUltima = await getUltimaAtualizacao('produtos');
-  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+  const hoje = new Date().toISOString().split('T')[0];
+  const filtros = dataUltima ? { 
+    dataAlteracaoInicial: dataUltima, 
+    dataAlteracaoFinal: hoje 
+  } : {};
 
   const dados = await fetchPaginatedData(token, 'produtos', 'Produtos', filtros);
   if (!dados.length) return;
@@ -303,72 +319,207 @@ async function sincronizarProdutos(token) {
   else console.log(`🚀 Produtos sincronizados com sucesso!`);
 }
 
+/* ==========================================================
+ * CONTAS A PAGAR E RECEBER (BUSCA DETALHADA PARA EXTRAIR CATEGORIA)
+ * ========================================================== */
+
 async function sincronizarContasPagar(token) {
   const dataUltima = await getUltimaAtualizacao('bling_contas_pagar');
-  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+  const hoje = new Date().toISOString().split('T')[0];
+  const filtros = dataUltima ? { 
+  dataAlteracaoInicial: dataUltima, 
+  dataAlteracaoFinal: hoje 
+} : {};
 
-  const dados = await fetchPaginatedData(token, 'contas/pagar', 'Contas a Pagar', filtros);
-  if (!dados.length) return;
+  // 1. Busca o resumo para pegar os IDs
+  const resumoContas = await fetchPaginatedData(token, 'contas/pagar', 'Contas a Pagar', filtros);
+  if (!resumoContas.length) return;
 
-  const formatados = dados.map((item) => ({
-    id: item.id,
-    situacao_id: item.situacao,
-    vencimento: item.vencimento,
-    vencimento_original: item.vencimentoOriginal,
-    data_emissao: item.dataEmissao,
-    valor: item.valor,
-    saldo: item.saldo,
-    contato_id: item.contato?.id || null,
-    forma_pagamento_id: item.formaPagamento?.id || null,
-    portador_id: item.portador?.id || null,
-    competencia: item.competencia || null,
-    numero_documento: item.numeroDocumento || null,
-    historico: item.historico || null,
-    raw_data: item,
-    updated_at: new Date().toISOString(),
-  }));
+  console.log(`🔎 Buscando detalhes de ${resumoContas.length} contas a pagar (para extrair Categoria)...`);
+  
+  const formatados = [];
 
-  const { error } = await supabase.from('bling_contas_pagar').upsert(formatados, { onConflict: 'id' });
-  if (error) console.error('❌ Erro ao salvar contas a pagar:', error);
-  else console.log(`🚀 Contas a Pagar sincronizadas com sucesso!`);
+  for (const itemResumo of resumoContas) {
+    try {
+      // 2. Busca o detalhe da conta
+      const responseDetalhe = await axios.get(
+        `https://www.bling.com.br/Api/v3/contas/pagar/${itemResumo.id}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      const item = responseDetalhe.data.data;
+
+      formatados.push({
+        id: item.id,
+        situacao_id: item.situacao,
+        vencimento: item.vencimento,
+        vencimento_original: item.vencimentoOriginal,
+        data_emissao: item.dataEmissao,
+        valor: item.valor,
+        saldo: item.saldo,
+        contato_id: item.contato?.id || null,
+        forma_pagamento_id: item.formaPagamento?.id || null,
+        categoria_id: item.categoria?.id || null, // <- AQUI ESTÁ A CATEGORIA!
+        portador_id: item.portador?.id || null,
+        competencia: item.competencia || null,
+        numero_documento: item.numeroDocumento || null,
+        historico: item.historico || null,
+        raw_data: item,
+        updated_at: new Date().toISOString(),
+      });
+
+      // 3. Pausa para respeitar o limite (Rate Limit)
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+    } catch (error) {
+      console.error(
+        `⚠️ Erro ao buscar detalhe da conta a pagar ${itemResumo.id}:`,
+        JSON.stringify(error.response?.data, null, 2) || error.message
+      );
+    }
+  }
+
+  if (formatados.length > 0) {
+    const { error } = await supabase.from('bling_contas_pagar').upsert(formatados, { onConflict: 'id' });
+    if (error) console.error('❌ Erro ao salvar contas a pagar:', error);
+    else console.log(`🚀 ${formatados.length} Contas a Pagar (com categoria) sincronizadas com sucesso!`);
+  }
 }
 
 async function sincronizarContasReceber(token) {
   const dataUltima = await getUltimaAtualizacao('bling_contas_receber');
-  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+  const hoje = new Date().toISOString().split('T')[0];
+  const filtros = dataUltima ? { 
+    dataAlteracaoInicial: dataUltima, 
+    dataAlteracaoFinal: hoje 
+  } : {};
 
-  const dados = await fetchPaginatedData(token, 'contas/receber', 'Contas a Receber', filtros);
-  if (!dados.length) return;
+  const resumoContas = await fetchPaginatedData(token, 'contas/receber', 'Contas a Receber', filtros);
+  if (!resumoContas.length) return;
 
-  const formatados = dados.map((item) => ({
-    id: item.id,
-    situacao_id: item.situacao,
-    vencimento: item.vencimento,
-    vencimento_original: item.vencimentoOriginal,
-    data_emissao: item.dataEmissao,
-    valor: item.valor,
-    saldo: item.saldo,
-    contato_id: item.contato?.id || null,
-    contato_nome: item.contato?.nome || null,
-    forma_pagamento_id: item.formaPagamento?.id || null,
-    categoria_id: item.categoria?.id || null,
-    vendedor_id: item.vendedor?.id || null,
-    origem_id: item.origem?.id || null,
-    origem_tipo: item.origem?.tipoOrigem || null,
-    raw_data: item,
-    updated_at: new Date().toISOString(),
-  }));
+  console.log(`🔎 Buscando detalhes de ${resumoContas.length} contas a receber (para extrair Categoria)...`);
+  
+  const formatados = [];
 
-  const { error } = await supabase.from('bling_contas_receber').upsert(formatados, { onConflict: 'id' });
-  if (error) console.error('❌ Erro ao salvar contas a receber:', error);
-  else console.log(`🚀 Contas a Receber sincronizadas com sucesso!`);
+  for (const itemResumo of resumoContas) {
+    try {
+      const responseDetalhe = await axios.get(
+        `https://www.bling.com.br/Api/v3/contas/receber/${itemResumo.id}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      const item = responseDetalhe.data.data;
+
+      formatados.push({
+        id: item.id,
+        situacao_id: item.situacao,
+        vencimento: item.vencimento,
+        vencimento_original: item.vencimentoOriginal,
+        data_emissao: item.dataEmissao,
+        valor: item.valor,
+        saldo: item.saldo,
+        contato_id: item.contato?.id || null,
+        contato_nome: item.contato?.nome || null,
+        forma_pagamento_id: item.formaPagamento?.id || null,
+        categoria_id: item.categoria?.id || null, // <- CATEGORIA GARANTIDA
+        vendedor_id: item.vendedor?.id || null,
+        origem_id: item.origem?.id || null,
+        origem_tipo: item.origem?.tipoOrigem || null,
+        raw_data: item,
+        updated_at: new Date().toISOString(),
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+    } catch (error) {
+      console.error(
+        `⚠️ Erro ao buscar detalhe da conta a receber ${itemResumo.id}:`,
+        JSON.stringify(error.response?.data, null, 2) || error.message
+      );
+    }
+  }
+
+  if (formatados.length > 0) {
+    const { error } = await supabase.from('bling_contas_receber').upsert(formatados, { onConflict: 'id' });
+    if (error) console.error('❌ Erro ao salvar contas a receber:', error);
+    else console.log(`🚀 ${formatados.length} Contas a Receber (com categoria) sincronizadas com sucesso!`);
+  }
+}
+
+/* ==========================================================
+ * MÓDULO DE ESTOQUE (POR LOTES DE PRODUTOS)
+ * ========================================================== */
+
+async function sincronizarEstoques(token) {
+  console.log('📦 Consultando IDs de produtos no banco local para buscar estoque...');
+  
+  // 1. Puxa todos os IDs de produtos que já foram salvos no Supabase
+  const { data: produtos, error } = await supabase.from('produtos').select('id');
+
+  if (error || !produtos || produtos.length === 0) {
+    console.log('🎯 Estoque ignorado: Nenhum produto encontrado no banco de dados para checar.');
+    return;
+  }
+
+  const ids = produtos.map(p => p.id);
+  const chunkSize = 50; // A API aceita vários IDs por vez. 50 é um número seguro.
+  const estoquesFormatados = [];
+
+  console.log(`🔎 Buscando saldos de estoque para ${ids.length} produtos (em lotes de ${chunkSize})...`);
+
+  // 2. Divide os IDs em lotes e faz a requisição
+  for (let i = 0; i < ids.length; i += chunkSize) {
+    const chunk = ids.slice(i, i + chunkSize);
+    
+    // Monta a querystring: idsProdutos[]=1&idsProdutos[]=2...
+    const queryParams = chunk.map(id => `idsProdutos[]=${id}`).join('&');
+
+    try {
+      const response = await axios.get(
+        `https://www.bling.com.br/Api/v3/estoques/saldos?${queryParams}`,
+        { headers: { Authorization: `Bearer ${token}` } }
+      );
+
+      const dados = response.data.data || [];
+
+      for (const item of dados) {
+        estoquesFormatados.push({
+          id: item.produto?.id, // O ID do produto será a chave primária na tabela de estoque
+          produto_id: item.produto?.id,
+          saldo_fisico: item.saldoFisico,
+          saldo_virtual: item.saldoVirtual,
+          updated_at: new Date().toISOString(),
+        });
+      }
+
+      // Pausa entre os lotes
+      await new Promise((resolve) => setTimeout(resolve, 350));
+
+    } catch (err) {
+      console.error(
+        `⚠️ Erro ao buscar lote de estoque:`, 
+        JSON.stringify(err.response?.data, null, 2) || err.message
+      );
+    }
+  }
+
+  // 3. Salva no banco
+  if (estoquesFormatados.length > 0) {
+    const { error: errUpsert } = await supabase.from('estoques').upsert(estoquesFormatados, { onConflict: 'id' });
+    if (errUpsert) console.error('❌ Erro ao salvar estoques:', errUpsert);
+    else console.log(`🚀 Saldos de ${estoquesFormatados.length} produtos sincronizados com sucesso!`);
+  }
 }
 
 async function sincronizarVendas(token) {
   const dataUltima = await getUltimaAtualizacao('vendas');
-  const filtros = dataUltima ? { dataAlteracaoInicial: dataUltima } : {};
+  const hoje = new Date().toISOString().split('T')[0];
+  const filtros = dataUltima ? { 
+  dataAlteracaoInicial: dataUltima, 
+  dataAlteracaoFinal: hoje 
+} : {};
 
-  // 1. Busca a lista de vendas (resumo) para pegar os IDs
+
   const resumoVendas = await fetchPaginatedData(token, 'pedidos/vendas', 'Vendas', filtros);
   if (!resumoVendas.length) return;
 
@@ -460,6 +611,7 @@ async function main() {
     // 2. Tabelas pesadas (Com filtro inteligente de data)
     await sincronizarContatos(token);
     await sincronizarProdutos(token);
+    await sincronizarEstoques(token);
     await sincronizarContasPagar(token);
     await sincronizarContasReceber(token);
     await sincronizarVendas(token);
